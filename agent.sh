@@ -3,7 +3,7 @@
 # agent.sh - Manage stateful code-server agent containers.
 #
 # Each agent is an isolated code-server instance with its own persistent
-# OverlayFS-backed root volume (agent-N-root). Agent N listens on port
+# OverlayFS-backed root volume (agentN_agent-root). Agent N listens on port
 # 8440 + N by default (agent 1 -> 8441, agent 2 -> 8442, ...).
 #
 # Usage:
@@ -97,7 +97,7 @@ print_info() {
 ================ Agent ${id} ================
   URL:       http://localhost:${port}
   Password:  ${PASSWORD}
-  Volume:    agent-${id}-root  (persistent state)
+  Volume:    $(project_name "$id")_agent-root  (persistent state)
   Project:   $(project_name "$id")
 
   Useful commands:
@@ -124,7 +124,7 @@ cmd_down() {
     require_agent_id "$id"
     echo ">> Stopping agent ${id} (persistent state preserved)..."
     compose_for_agent "$id" down
-    echo ">> Agent ${id} stopped. Its volume 'agent-${id}-root' is intact."
+    echo ">> Agent ${id} stopped. Its volume '$(project_name "$id")_agent-root' is intact."
 }
 
 cmd_destroy() {
@@ -138,10 +138,11 @@ cmd_destroy() {
     fi
     echo ">> Destroying agent ${id} (container + volume)..."
     compose_for_agent "$id" down --volumes
-    # The compose-managed volume is named "<project>_agent-${id}-root". Older
-    # setups may also have a top-level "agent-${id}-root" volume; remove both
-    # if present so the next 'up' starts from a pristine image.
-    docker volume rm "$(project_name "$id")_agent-${id}-root" 2>/dev/null || true
+    # 'down --volumes' already removes the project-scoped volume
+    # ("<project>_agent-root"). As a belt-and-suspenders cleanup, also remove
+    # any legacy "agent-${id}-root" volume from older fixed-name setups so the
+    # next 'up' always starts from a pristine image.
+    docker volume rm "$(project_name "$id")_agent-root" 2>/dev/null || true
     docker volume rm "agent-${id}-root" 2>/dev/null || true
     echo ">> Agent ${id} destroyed. Next 'up' will start fresh from the base image."
 }
