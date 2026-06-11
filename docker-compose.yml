@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  code-server:
+    build: .
+    image: custom-stateful-code-server:latest
+    container_name: code-server-agent-${AGENT_ID:-1}
+    user: root
+    privileged: true # CRITICAL: Allows the container to execute the internal mount commands
+    ports:
+      - "${PORT:-8443}:8443"
+    environment:
+      - PASSWORD=a2s47df8
+      - SUDO_PASSWORD=potato
+    volumes:
+      # A single volume handles the entire stateful OS layer for this specific agent.
+      # Each agent runs under its own compose project (agent1, agent2, ...), so the
+      # volume below is namespaced per project and isolated from other agents.
+      - agent-${AGENT_ID:-1}-root:/mnt/persistent
+    restart: unless-stopped
+
+volumes:
+  # The persistent root for this agent. The actual volume name is derived from
+  # the AGENT_ID and the compose project name (e.g. agent1_agent-1-root).
+  agent-${AGENT_ID:-1}-root:
