@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   code-server:
     build: .
@@ -14,10 +12,12 @@ services:
       - SUDO_PASSWORD=potato
     volumes:
       # A single volume handles the entire stateful OS layer for this agent.
+      # Mounted at /persist; entrypoint.sh overlays the whole root onto it so all
+      # runtime writes (apt installs, /usr/local, /root, /config, ...) persist.
       # Each agent runs under its own compose project (agent1, agent2, ...), so
       # the volume below is namespaced per project (e.g. agent1_agent-root) and
       # is therefore fully isolated from every other agent.
-      - agent-root:/mnt/persistent
+      - agent-root:/persist
     restart: unless-stopped
 
 volumes:
