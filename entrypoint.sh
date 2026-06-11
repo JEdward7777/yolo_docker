@@ -3,48 +3,53 @@
 # entrypoint.sh - Boot code-server on top of a persistent OverlayFS root.
 #
 # Goal: the container's entire root filesystem is overlaid so that EVERYTHING
-# written at runtime (apt installs, /usr/local binaries, /root, /config, etc.)
+# written at runtime (apt installs, /usr/local binaries, /root, /config, ...)
 # lands on a persistent Docker volume and survives container recreation.
 #
-# Design (and why it differs from a naive overlay+chroot):
+# The subtle problem this solves:
+#   OverlayFS requires that `upperdir`/`workdir` are NOT located inside
+#   `lowerdir`. We want lowerdir = / (the pristine image) and the persistent
+#   volume is mounted at /persist (under /). If we used `lowerdir=/` directly,
+#   then upperdir=/persist/upper sits *inside* lowerdir, which violates the rule
+#   and causes copy-ups to silently never reach the real volume (writes vanish
+#   on container teardown).
 #
-#   The persistent volume is mounted at /persist, which is OUTSIDE the overlay's
-#   lower layer content we care about. The overlay uses:
-#       lowerdir = /            (the pristine image, read-only)
-#       upperdir = /persist/upper   (writes land here -> on the volume)
-#       workdir  = /persist/work
-#       merged   = /persist/merged
-#
-#   We then pivot_root into the merged tree. The trick that makes persistence
-#   actually work: we BIND the real volume (/persist) into the merged tree
-#   BEFORE pivoting, so that after the switch, /persist inside the new root is
-#   the REAL volume -- not an overlay-shadowed copy of it. Because upperdir and
-#   workdir were pinned (at mount time) to the real volume inodes, every copy-up
-#   is written straight through to the volume.
-#
-#   A previous version used `lowerdir=/` while the volume itself lived at the
-#   same path being overlaid, which recursively shadowed the volume and silently
-#   discarded all writes on container teardown. This version avoids that.
+# The fix:
+#   A bind mount of `/` is NON-RECURSIVE: it does not carry submounts (like the
+#   /persist volume, /proc, /dev, ...) into the target. So if we bind `/` to a
+#   scratch dir /lower, then /lower is a faithful copy of the pristine image but
+#   with an EMPTY /lower/persist (the volume submount is not pulled in). Using
+#   `lowerdir=/lower` then guarantees upperdir/workdir (on the volume) are NOT
+#   inside lowerdir. OverlayFS is happy and copy-ups go straight to the volume.
 #
 set -e
 
-PERSIST="/persist"           # where the Docker volume is mounted (outside lowerdir concerns)
-UPPER="$PERSIST/upper"
+PERSIST="/persist"           # Docker volume mount (already mounted by Docker before we run)
+LOWER="/lower"               # clean, non-recursive bind of / used as the overlay lower layer
+UPPER="$PERSIST/upper"       # writes land here -> on the persistent volume
 WORK="$PERSIST/work"
 MERGED="$PERSIST/merged"
 
-# 1. Make sure the overlay scaffolding exists on the persistent volume.
-mkdir -p "$UPPER" "$WORK" "$MERGED"
+# 1. Scaffolding on the persistent volume.
+mkdir -p "$UPPER" "$WORK" "$MERGED" "$LOWER"
 
-# 2. Build the OverlayFS. lowerdir=/ is the pristine image; writes go to UPPER.
-#    If a previous run already mounted it (e.g. on a plain restart), skip.
+# 2. Non-recursive bind of / -> /lower. This gives a lower layer that is the
+#    pristine image WITHOUT the /persist volume (and without /proc, /sys, /dev)
+#    pulled in, so upperdir/workdir are safely outside lowerdir.
+if ! mountpoint -q "$LOWER"; then
+    mount --bind / "$LOWER"
+    # Re-assert non-recursive/private so the volume can never propagate in.
+    mount --make-rprivate "$LOWER" 2>/dev/null || true
+fi
+
+# 3. Build the OverlayFS using the clean lower layer.
 if ! mountpoint -q "$MERGED"; then
     mount -t overlay overlay \
-        -o lowerdir=/,upperdir="$UPPER",workdir="$WORK" \
+        -o lowerdir="$LOWER",upperdir="$UPPER",workdir="$WORK" \
         "$MERGED"
 fi
 
-# 3. Provide the kernel API filesystems inside the merged root.
+# 4. Provide the kernel API filesystems inside the merged root.
 for fs in proc sys dev dev/pts; do
     mkdir -p "$MERGED/$fs"
 done
@@ -53,15 +58,22 @@ mountpoint -q "$MERGED/sys"     || mount --bind /sys     "$MERGED/sys"
 mountpoint -q "$MERGED/dev"     || mount --bind /dev     "$MERGED/dev"
 mountpoint -q "$MERGED/dev/pts" || mount --bind /dev/pts "$MERGED/dev/pts"
 
-# 4. CRITICAL: expose the REAL persistent volume inside the merged root, so that
-#    after we switch roots, /persist still points at the actual volume (and thus
-#    so do the upper/work dirs the overlay copies into).
-mkdir -p "$MERGED$PERSIST"
-mountpoint -q "$MERGED$PERSIST" || mount --bind "$PERSIST" "$MERGED$PERSIST"
+# 5. Networking: Docker manages /etc/resolv.conf, /etc/hosts and /etc/hostname
+#    on the OUTER root. The overlay's lower layer has stale/empty copies, so DNS
+#    fails inside the chroot (breaking apt installs). Bind the live files in so
+#    the agent has working name resolution. These are runtime files and are
+#    intentionally NOT persisted (Docker regenerates them each start).
+for netfile in /etc/resolv.conf /etc/hosts /etc/hostname; do
+    if [ -e "$netfile" ]; then
+        # Ensure a target exists in the merged tree, then bind the live file over it.
+        touch "$MERGED$netfile" 2>/dev/null || true
+        mountpoint -q "$MERGED$netfile" || mount --bind "$netfile" "$MERGED$netfile"
+    fi
+done
 
 echo "Agent partition initialized. Switching to persistent root..."
 
-# 5. Switch into the merged root. We use chroot here (privileged container,
-#    single PID namespace) which is sufficient and simpler than pivot_root for
-#    this use case. The bind mounts above keep everything pointing at the volume.
+# 6. Switch into the merged root. chroot is sufficient here (privileged
+#    container, single mount namespace); pivot_root is unnecessary because the
+#    overlay correctness above is what actually makes persistence work.
 exec chroot "$MERGED" "$@"
