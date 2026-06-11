@@ -64,6 +64,21 @@ This project gives each agent:
   volume. It then `chroot`s into the merged root and hands off to code-server's
   normal `/init`. The result: every filesystem change the agent makes is written
   to the volume.
+
+  Two non-obvious details make this actually work (both verified by live testing):
+
+  1. **The volume must not be inside the overlay's lower layer.** OverlayFS
+     forbids `upperdir`/`workdir` from living inside `lowerdir`. Since the volume
+     is mounted at `/persist` (under `/`), naively using `lowerdir=/` would put
+     the upper dir inside the lower dir and silently discard all writes on
+     teardown. The entrypoint sidesteps this by doing a **non-recursive bind of
+     `/` to `/lower`** — a non-recursive bind does not pull in submounts, so
+     `/lower` is the pristine image with an *empty* `/lower/persist`. Using
+     `lowerdir=/lower` keeps upper/work safely outside the lower layer.
+  2. **DNS must be wired into the chroot.** Docker manages `/etc/resolv.conf`,
+     `/etc/hosts`, and `/etc/hostname` on the outer root; inside the chroot they
+     are stale/empty, which breaks `apt`. The entrypoint bind-mounts the live
+     copies into the merged tree so package installs work.
 - [`docker-compose.yml`](docker-compose.yml) wires up the volume, ports, and
   password. The volume key is static (`agent-root`); per-agent isolation comes
   from running each agent under its own compose **project** (`agent1`, `agent2`,
@@ -192,6 +207,61 @@ This setup intentionally trades isolation strictness for agent freedom. Be aware
   When in doubt, `destroy` and start fresh.
 
 ---
+
+## Cloning code from your host (SSH / git)
+
+You can SSH from inside the container back to your host machine and `git clone`
+local repos. The container reaches the host via the Docker bridge **gateway IP**
+(not `localhost`, which inside the container refers to the container itself).
+
+1. Find the gateway IP for the agent's network (this is your host from the
+   container's point of view):
+   ```bash
+   docker network inspect agent<N>_default --format '{{ (index .IPAM.Config 0).Gateway }}'
+   # e.g. 172.20.0.1
+   ```
+   On Docker Desktop (macOS/Windows) you can instead use the hostname
+   `host.docker.internal`.
+
+2. Make sure your host is running an SSH server (`sshd` on port 22) and that your
+   user account accepts your key/password.
+
+3. From the **editor terminal** inside code-server:
+   ```bash
+   # one-off clone over SSH (replace user + path to your repo)
+   git clone ssh://youruser@172.20.0.1/home/youruser/path/to/repo.git
+
+   # or add a convenient host alias in ~/.ssh/config (persists on the volume!)
+   cat >> ~/.ssh/config <<'CFG'
+   Host hostmachine
+       HostName 172.20.0.1
+       User youruser
+   CFG
+   git clone hostmachine:/home/youruser/path/to/repo.git
+   ```
+
+Because `~/.ssh/` lives in the persistent root, your keys and `ssh/config` survive
+`down`/`up` (and are wiped by `destroy`). `git` and `ssh` are already installed in
+the image.
+
+> Tip: the gateway IP can change if you recreate the network. The `~/.ssh/config`
+> alias just needs its `HostName` updated if that happens.
+
+## Troubleshooting
+
+- **An `apt install <pkg>` says "Unable to locate package".** Run `apt-get update`
+  first inside the editor terminal. Also note some packages (e.g. `cowsay`) have
+  been removed from current Ubuntu repos and simply aren't installable anymore —
+  that's a repo issue, not a persistence issue.
+- **"I installed something with `docker exec` and it vanished."** `docker exec`
+  drops you into the container's **outer** root, *not* the persistent chroot that
+  code-server runs in. Installs done that way do **not** persist. Always install
+  from **inside the code-server editor terminal** (or its web UI), which runs in
+  the persistent root. Files created in the editor land on the volume.
+- **Verifying persistence yourself:** create a file or install a package from the
+  editor terminal, then `./agent.sh down <N>` followed by `./agent.sh up <N>`.
+  Your file/package should still be there. This was validated end-to-end during
+  development (e.g. `apt install tree` survived a full down/up cycle).
 
 ## Files
 
