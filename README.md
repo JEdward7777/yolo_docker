@@ -38,7 +38,7 @@ This project gives each agent:
 ## How it works
 
 ```
-┌─────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────┐
 │ Container (privileged)                                    │
 │                                                           │
 │   lowerdir = /            (pristine code-server image)    │
@@ -265,9 +265,9 @@ the image.
 
 ## Files
 
-| File                                       | Purpose                                                   |
-| ------------------------------------------ | --------------------------------------------------------- |
-| [`agent.sh`](agent.sh)                     | Management CLI (up / down / destroy / logs / info / status). |
-| [`docker-compose.yml`](docker-compose.yml) | Service, ports, password, and persistent volume.          |
-| [`Dockerfile`](Dockerfile)                 | Builds code-server with the custom overlay entrypoint.    |
+| File                                       | Purpose                                                     |
+| ------------------------------------------ | ----------------------------------------------------------- |
+| [`agent.sh`](agent.sh)                     | Management CLI (up / down / destroy / logs / info / status).|
+| [`docker-compose.yml`](docker-compose.yml) | Service, ports, password, and persistent volume.            |
+| [`Dockerfile`](Dockerfile)                 | Builds code-server with the custom overlay entrypoint.      |
 | [`entrypoint.sh`](entrypoint.sh)           | Sets up the OverlayFS and chroots into the persistent root. |
