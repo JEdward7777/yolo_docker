@@ -7,12 +7,13 @@
 # 8440 + N by default (agent 1 -> 8441, agent 2 -> 8442, ...).
 #
 # Usage:
-#   ./agent.sh up      <N>   Build (if needed) and start agent N
-#   ./agent.sh down    <N>   Stop & remove agent N's container (state PRESERVED)
-#   ./agent.sh destroy <N>   Stop, remove, and WIPE agent N's persistent volume
-#   ./agent.sh logs    <N>   Follow logs for agent N
-#   ./agent.sh status        Show all running agents
-#   ./agent.sh info    <N>   Show connection info for agent N
+#   ./agent.sh up      <N>        Build (if needed) and start agent N
+#   ./agent.sh down    <N>        Stop & remove agent N's container (state PRESERVED)
+#   ./agent.sh destroy <N>        Stop, remove, and WIPE agent N's persistent volume
+#   ./agent.sh copy    <SRC> <DST> Mirror agent SRC's volume onto agent DST (OVERWRITES DST)
+#   ./agent.sh logs    <N>        Follow logs for agent N
+#   ./agent.sh status             Show all running agents
+#   ./agent.sh info    <N>        Show connection info for agent N
 #
 set -euo pipefail
 
@@ -39,18 +40,21 @@ usage() {
 Usage: ./agent.sh <command> [agent-number]
 
 Commands:
-  up      <N>   Build (if needed) and start agent N in the background.
-  down    <N>   Stop and remove agent N's container. Persistent state is KEPT.
-  destroy <N>   Stop, remove, and DELETE agent N's persistent volume (full reset).
-  logs    <N>   Follow the logs for agent N.
-  info    <N>   Print connection details for agent N.
-  status        List all running agent containers.
+  up      <N>         Build (if needed) and start agent N in the background.
+  down    <N>         Stop and remove agent N's container. Persistent state is KEPT.
+  destroy <N>         Stop, remove, and DELETE agent N's persistent volume (full reset).
+  copy    <SRC> <DST> Stop both agents, then mirror agent SRC's volume onto agent
+                      DST (OVERWRITES DST's state). Both agents are left stopped.
+  logs    <N>         Follow the logs for agent N.
+  info    <N>         Print connection details for agent N.
+  status              List all running agent containers.
 
 Examples:
   ./agent.sh up 1        # start agent 1 on port 8441
   ./agent.sh up 2        # start agent 2 on port 8442
   ./agent.sh down 1      # stop agent 1, keep its files
   ./agent.sh destroy 1   # nuke agent 1's state for a fresh project
+  ./agent.sh copy 1 2    # clone agent 1's volume onto agent 2 (wipes agent 2)
 EOF
 }
 
@@ -77,6 +81,17 @@ agent_port() {
 # 'down --volumes' only affects the targeted agent.
 project_name() {
     echo "${PROJECT_PREFIX}${1}"
+}
+
+# The real Docker volume name for an agent (compose namespaces it with the
+# project name, e.g. agent1 -> agent1_agent-root).
+volume_name() {
+    echo "$(project_name "$1")_agent-root"
+}
+
+# True if the named Docker volume currently exists.
+volume_exists() {
+    docker volume inspect "$1" >/dev/null 2>&1
 }
 
 # Run docker compose for a specific agent with the right env + project name.
@@ -147,6 +162,70 @@ cmd_destroy() {
     echo ">> Agent ${id} destroyed. Next 'up' will start fresh from the base image."
 }
 
+cmd_copy() {
+    local src="$1"
+    local dst="$2"
+    require_agent_id "$src"
+    require_agent_id "$dst"
+
+    if [[ "$src" == "$dst" ]]; then
+        echo "ERROR: Source and destination agents must differ (got '$src' and '$dst')." >&2
+        exit 1
+    fi
+
+    local src_vol dst_vol
+    src_vol="$(volume_name "$src")"
+    dst_vol="$(volume_name "$dst")"
+
+    if ! volume_exists "$src_vol"; then
+        echo "ERROR: Source volume '${src_vol}' does not exist." >&2
+        echo "       Agent ${src} has no persistent state to copy (was it ever started?)." >&2
+        exit 1
+    fi
+
+    echo "!! WARNING: This will OVERWRITE agent ${dst}'s state with a copy of agent ${src}'s."
+    echo "!!          Agent ${dst}'s volume '${dst_vol}' will be mirrored to match agent ${src}'s"
+    echo "!!          (files not present in the source will be DELETED)."
+    read -r -p "Type 'yes' to confirm copying agent ${src} -> agent ${dst}: " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        echo ">> Aborted. Nothing was copied."
+        exit 0
+    fi
+
+    # Stop both agents so nothing is writing to the volumes during the copy.
+    # 'down' is a no-op (aside from a warning) if the agent is already stopped.
+    echo ">> Stopping agent ${src} (source)..."
+    compose_for_agent "$src" down
+    echo ">> Stopping agent ${dst} (destination)..."
+    compose_for_agent "$dst" down
+
+    # Keep the destination volume if it already exists so rsync can perform an
+    # incremental mirror; only create it when missing.
+    if volume_exists "$dst_vol"; then
+        echo ">> Reusing existing destination volume '${dst_vol}' (incremental mirror)."
+    else
+        echo ">> Creating destination volume '${dst_vol}'..."
+        docker volume create "$dst_vol" >/dev/null
+    fi
+
+    # Mirror the source volume onto the destination using rsync in a throwaway
+    # Alpine container. Alpine is an official, well-maintained image and we
+    # install a fresh rsync at runtime so the tool never depends on a stale,
+    # third-party image baking in an aging rsync/apt.
+    #   -a            archive (perms, times, symlinks, ownership)
+    #   -H -A -X      preserve hard links, ACLs, extended attributes
+    #   --numeric-ids preserve raw uid/gid (root files; no shared user db here)
+    #   --delete      mirror: remove dest files not present in the source
+    echo ">> Copying agent ${src}'s volume -> agent ${dst}'s volume via rsync..."
+    docker run --rm \
+        -v "${src_vol}:/from:ro" \
+        -v "${dst_vol}:/to" \
+        alpine sh -c 'apk add --no-cache rsync >/dev/null && rsync -aHAX --numeric-ids --delete /from/ /to/'
+
+    echo ">> Done. Agent ${dst}'s volume now mirrors agent ${src}'s."
+    echo ">> Both agents are stopped. Start them with: ./agent.sh up <N>"
+}
+
 cmd_logs() {
     local id="$1"
     require_agent_id "$id"
@@ -172,6 +251,7 @@ case "$COMMAND" in
     up)      cmd_up "${2:-}" ;;
     down)    cmd_down "${2:-}" ;;
     destroy) cmd_destroy "${2:-}" ;;
+    copy)    cmd_copy "${2:-}" "${3:-}" ;;
     logs)    cmd_logs "${2:-}" ;;
     info)    cmd_info "${2:-}" ;;
     status)  cmd_status ;;
