@@ -7,13 +7,15 @@
 # 8440 + N by default (agent 1 -> 8441, agent 2 -> 8442, ...).
 #
 # Usage:
-#   ./agent.sh up      <N>        Build (if needed) and start agent N
-#   ./agent.sh down    <N>        Stop & remove agent N's container (state PRESERVED)
-#   ./agent.sh destroy <N>        Stop, remove, and WIPE agent N's persistent volume
+#   ./agent.sh up      <N>         Build (if needed) and start agent N
+#   ./agent.sh down    <N>         Stop & remove agent N's container (state PRESERVED)
+#   ./agent.sh destroy <N>         Stop, remove, and WIPE agent N's persistent volume
 #   ./agent.sh copy    <SRC> <DST> Mirror agent SRC's volume onto agent DST (OVERWRITES DST)
-#   ./agent.sh logs    <N>        Follow logs for agent N
-#   ./agent.sh status             Show all running agents
-#   ./agent.sh info    <N>        Show connection info for agent N
+#   ./agent.sh export  <N> [FILE]  Export agent N's volume to a .tar.gz archive
+#   ./agent.sh import  <FILE> <N>  Import a .tar.gz archive into agent N (OVERWRITES state)
+#   ./agent.sh logs    <N>         Follow logs for agent N
+#   ./agent.sh status              Show all running agents
+#   ./agent.sh info    <N>         Show connection info for agent N
 #
 set -euo pipefail
 
@@ -40,21 +42,28 @@ usage() {
 Usage: ./agent.sh <command> [agent-number]
 
 Commands:
-  up      <N>         Build (if needed) and start agent N in the background.
-  down    <N>         Stop and remove agent N's container. Persistent state is KEPT.
-  destroy <N>         Stop, remove, and DELETE agent N's persistent volume (full reset).
-  copy    <SRC> <DST> Stop both agents, then mirror agent SRC's volume onto agent
-                      DST (OVERWRITES DST's state). Both agents are left stopped.
-  logs    <N>         Follow the logs for agent N.
-  info    <N>         Print connection details for agent N.
-  status              List all running agent containers.
+  up      <N>          Build (if needed) and start agent N in the background.
+  down    <N>          Stop and remove agent N's container. Persistent state is KEPT.
+  destroy <N>          Stop, remove, and DELETE agent N's persistent volume (full reset).
+  copy    <SRC> <DST>  Stop both agents, then mirror agent SRC's volume onto agent
+                       DST (OVERWRITES DST's state). Both agents are left stopped.
+  export  <N> [FILE]   Export agent N's volume to a .tar.gz archive. Agent is stopped
+                       first and left stopped. FILE defaults to ./agent_N_export.tar.gz.
+  import  <FILE> <N>   Import a .tar.gz archive into agent N, REPLACING all existing
+                       state. Agent is stopped first and left stopped.
+  logs    <N>          Follow the logs for agent N.
+  info    <N>          Print connection details for agent N.
+  status               List all running agent containers.
 
 Examples:
-  ./agent.sh up 1        # start agent 1 on port 8441
-  ./agent.sh up 2        # start agent 2 on port 8442
-  ./agent.sh down 1      # stop agent 1, keep its files
-  ./agent.sh destroy 1   # nuke agent 1's state for a fresh project
-  ./agent.sh copy 1 2    # clone agent 1's volume onto agent 2 (wipes agent 2)
+  ./agent.sh up 1                          # start agent 1 on port 8441
+  ./agent.sh up 2                          # start agent 2 on port 8442
+  ./agent.sh down 1                        # stop agent 1, keep its files
+  ./agent.sh destroy 1                     # nuke agent 1's state for a fresh project
+  ./agent.sh copy 1 2                      # clone agent 1's volume onto agent 2 (wipes agent 2)
+  ./agent.sh export 3                      # export agent 3 -> ./agent_3_export.tar.gz
+  ./agent.sh export 3 ./backup.tar.gz      # export agent 3 -> ./backup.tar.gz
+  ./agent.sh import ./agent_3_export.tar.gz 3  # import archive into agent 3 (wipes agent 3)
 EOF
 }
 
@@ -226,6 +235,107 @@ cmd_copy() {
     echo ">> Both agents are stopped. Start them with: ./agent.sh up <N>"
 }
 
+cmd_export() {
+    local id="$1"
+    local file="${2:-}"
+    require_agent_id "$id"
+
+    # Default export path if not provided.
+    if [[ -z "$file" ]]; then
+        file="./agent_${id}_export.tar.gz"
+    fi
+
+    local vol
+    vol="$(volume_name "$id")"
+
+    if ! volume_exists "$vol"; then
+        echo "ERROR: Volume '${vol}' does not exist." >&2
+        echo "       Agent ${id} has no persistent state to export (was it ever started?)." >&2
+        exit 1
+    fi
+
+    echo ">> Stopping agent ${id} before export..."
+    compose_for_agent "$id" down
+
+    # Resolve the file path to an absolute path so the bind-mount works
+    # correctly regardless of the current directory.
+    local abs_dir abs_file
+    abs_dir="$(cd "$(dirname "$file")" && pwd)"
+    abs_file="${abs_dir}/$(basename "$file")"
+
+    local base_name
+    base_name="$(basename "$file")"
+
+    echo ">> Exporting volume '${vol}' -> ${abs_file} (max compression)..."
+    docker run --rm \
+        -v "${vol}:/data:ro" \
+        -v "${abs_dir}:/backup" \
+        -e "ARCHIVE_NAME=${base_name}" \
+        alpine sh -c 'GZIP=-9 tar czf "/backup/${ARCHIVE_NAME}" -C /data .'
+
+    echo ">> Export complete: ${abs_file}"
+    echo ">> Agent ${id} is stopped. Start it with: ./agent.sh up ${id}"
+}
+
+cmd_import() {
+    local file="$1"
+    local id="$2"
+    require_agent_id "$id"
+
+    if [[ -z "$file" ]]; then
+        echo "ERROR: Missing archive file path." >&2
+        usage
+        exit 1
+    fi
+
+    if [[ ! -f "$file" ]]; then
+        echo "ERROR: File '${file}' does not exist or is not a regular file." >&2
+        exit 1
+    fi
+
+    local vol
+    vol="$(volume_name "$id")"
+
+    echo "!! WARNING: This will REPLACE all of agent ${id}'s persistent state"
+    echo "!!          with the contents of '${file}'."
+    echo "!!          Volume '${vol}' will be destroyed and recreated."
+    read -r -p "Type 'yes' to confirm importing into agent ${id}: " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        echo ">> Aborted. Nothing was imported."
+        exit 0
+    fi
+
+    echo ">> Stopping agent ${id} before import..."
+    compose_for_agent "$id" down
+
+    # Remove the existing volume (if any) so we start completely fresh.
+    if volume_exists "$vol"; then
+        echo ">> Removing existing volume '${vol}'..."
+        docker volume rm "$vol" >/dev/null
+    fi
+
+    echo ">> Creating fresh volume '${vol}'..."
+    docker volume create "$vol" >/dev/null
+
+    # Resolve the file path to an absolute path so the bind-mount works.
+    local abs_dir abs_file
+    abs_dir="$(cd "$(dirname "$file")" && pwd)"
+    abs_file="${abs_dir}/$(basename "$file")"
+
+    local base_name
+    base_name="$(basename "$file")"
+
+    echo ">> Importing ${abs_file} -> volume '${vol}' ..."
+    docker run --rm \
+        -v "${vol}:/data" \
+        -v "${abs_dir}:/backup:ro" \
+        -e "ARCHIVE_NAME=${base_name}" \
+        alpine sh -c 'tar xzf "/backup/${ARCHIVE_NAME}" -C /data'
+
+    echo ">> Import complete. Volume '${vol}' now contains the archive contents."
+    echo ">> Agent ${id} is stopped. Start it with: ./agent.sh up ${id}"
+}
+
 cmd_logs() {
     local id="$1"
     require_agent_id "$id"
@@ -252,6 +362,8 @@ case "$COMMAND" in
     down)    cmd_down "${2:-}" ;;
     destroy) cmd_destroy "${2:-}" ;;
     copy)    cmd_copy "${2:-}" "${3:-}" ;;
+    export)  cmd_export "${2:-}" "${3:-}" ;;
+    import)  cmd_import "${2:-}" "${3:-}" ;;
     logs)    cmd_logs "${2:-}" ;;
     info)    cmd_info "${2:-}" ;;
     status)  cmd_status ;;
