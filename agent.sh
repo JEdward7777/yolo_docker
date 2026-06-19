@@ -14,7 +14,7 @@
 #   ./agent.sh export  <N> [FILE]  Export agent N's volume to a .tar.gz archive
 #   ./agent.sh import  <FILE> <N>  Import a .tar.gz archive into agent N (OVERWRITES state)
 #   ./agent.sh logs    <N>         Follow logs for agent N
-#   ./agent.sh status              Show all running agents
+#   ./agent.sh status              Show status (UP/DOWN) of all agents
 #   ./agent.sh info    <N>         Show connection info for agent N
 #
 set -euo pipefail
@@ -53,7 +53,7 @@ Commands:
                        state. Agent is stopped first and left stopped.
   logs    <N>          Follow the logs for agent N.
   info    <N>          Print connection details for agent N.
-  status               List all running agent containers.
+  status               Show status (UP/DOWN) of all known agents.
 
 Examples:
   ./agent.sh up 1                          # start agent 1 on port 8441
@@ -349,9 +349,44 @@ cmd_info() {
 }
 
 cmd_status() {
-    echo ">> Running agent containers:"
-    docker ps --filter "name=code-server-agent-" \
-        --format "table {{.Names}}\t{{.Ports}}\t{{.Status}}"
+    # Discover every agent volume that exists (pattern: agent<N>_agent-root).
+    # This tells us which agents have been created, whether running or not.
+    local volumes
+    volumes="$(docker volume ls --format '{{.Name}}' | grep -E '^agent[0-9]+_agent-root$' | sort -t 'a' -k2 -V)"
+
+    if [[ -z "$volumes" ]]; then
+        echo ">> No agent volumes found. No agents have been created yet."
+        return
+    fi
+
+    # Collect running container names once for fast lookups.
+    local running
+    running="$(docker ps --filter "name=code-server-agent-" --format '{{.Names}}')"
+
+    # Header
+    printf "\n  %-10s  %-6s  %-6s  %-26s  %s\n" "AGENT" "STATUS" "PORT" "VOLUME" "CONTAINER"
+    printf "  %-10s  %-6s  %-6s  %-26s  %s\n" "-----" "------" "----" "------" "---------"
+
+    local vol id port container status_text status_color
+    for vol in $volumes; do
+        # Extract the agent number from the volume name (e.g. agent3_agent-root -> 3).
+        id="${vol%%_agent-root}"
+        id="${id#agent}"
+        port="$(agent_port "$id")"
+        container="code-server-agent-${id}"
+
+        if echo "$running" | grep -qx "$container"; then
+            status_text="UP"
+            status_color="\033[32m"   # green
+        else
+            status_text="DOWN"
+            status_color="\033[31m"   # red
+        fi
+
+        printf "  %-10s  ${status_color}%-6s\033[0m  %-6s  %-26s  %s\n" \
+            "Agent ${id}" "${status_text}" "${port}" "${vol}" "${container}"
+    done
+    echo ""
 }
 
 # --- Dispatch ----------------------------------------------------------------
