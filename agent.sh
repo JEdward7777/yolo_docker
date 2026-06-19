@@ -352,7 +352,9 @@ cmd_status() {
     # Discover every agent volume that exists (pattern: agent<N>_agent-root).
     # This tells us which agents have been created, whether running or not.
     local volumes
-    volumes="$(docker volume ls --format '{{.Name}}' | grep -E '^agent[0-9]+_agent-root$' | sort -t 'a' -k2 -V)"
+    # `|| true` keeps `set -euo pipefail` from aborting when grep finds no
+    # matches (zero agents yet) so the empty-state branch below can run.
+    volumes="$(docker volume ls --format '{{.Name}}' | { grep -E '^agent[0-9]+_agent-root$' || true; } | sort -t 'a' -k2 -V)"
 
     if [[ -z "$volumes" ]]; then
         echo ">> No agent volumes found. No agents have been created yet."
